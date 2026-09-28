@@ -6,6 +6,7 @@ import android.content.*;
 import android.content.pm.PackageManager;
 import android.graphics.*;
 import android.net.Uri;
+import android.net.NetworkInfo;
 import android.net.wifi.p2p.*;
 import android.os.*;
 import android.provider.Settings;
@@ -72,7 +73,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    @Override protected void onResume(){ super.onResume(); registerReceiver(receiver,filter); }
+    @Override protected void onResume(){ super.onResume(); if(Build.VERSION.SDK_INT>=33) registerReceiver(receiver,filter,Context.RECEIVER_NOT_EXPORTED); else registerReceiver(receiver,filter); }
     @Override protected void onPause(){ unregisterReceiver(receiver); super.onPause(); }
     @Override protected void onDestroy(){ io.shutdownNow(); super.onDestroy(); }
 
