@@ -36,7 +36,10 @@ public class MainActivity extends Activity {
     private Button refresh;
     private Uri imageUri;
     private volatile boolean p2pConnected;
+    private volatile boolean phoneIsGroupOwner;
     private volatile String printerHost;
+    private volatile Socket acceptedPrinterSocket;
+    private volatile ServerSocket serverSocket;
     private String printerName = "";
     private final ExecutorService io = Executors.newSingleThreadExecutor();
 
@@ -124,6 +127,7 @@ public class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        closeSockets();
         io.shutdownNow();
         super.onDestroy();
     }
@@ -131,7 +135,9 @@ public class MainActivity extends Activity {
     private void startDiscovery() {
         if (p2p == null || channel == null) return;
         p2pConnected = false;
+        phoneIsGroupOwner = false;
         printerHost = null;
+        closeSockets();
         pick.setEnabled(false);
         setStatus("프린터 검색 중...");
 
@@ -244,25 +250,52 @@ public class MainActivity extends Activity {
     }
 
     private void sendPrint(byte[] jpeg) throws Exception {
-        String host = printerHost;
         if (!p2pConnected)
             throw new IOException("프린터와 Wi-Fi Direct 연결이 없습니다.");
 
-        // The original app uses 10.192.168.1:1234. Prefer the address learned
-        // from Wi-Fi Direct when available, but retain the original endpoint
-        // as a fallback because this printer/app family uses a legacy fixed IP.
-        if (host == null || host.length() == 0) host = LEGACY_PRINTER_HOST;
+        Socket s = null;
+        boolean closeWhenDone = true;
 
-        final String target = host;
-        runOnUiThread(() -> setStatus("프린터 연결 확인: " + target + ":" + PRINTER_PORT));
-
-        Socket s = new Socket();
-        try {
-            s.setKeepAlive(true);
-            s.setTcpNoDelay(true);
-            s.connect(new InetSocketAddress(target, PRINTER_PORT), CONNECT_TIMEOUT_MS);
+        if (phoneIsGroupOwner) {
+            // Original ConnectionService starts a TCP server when the phone is
+            // the P2P group owner. The printer then connects back to port 1234.
+            s = acceptedPrinterSocket;
+            if (s == null || s.isClosed())
+                throw new IOException("프린터 TCP 연결을 기다리는 중입니다.");
+            closeWhenDone = false;
             s.setSoTimeout(RESPONSE_TIMEOUT_MS);
+        } else {
+            String learned = printerHost;
+            String[] hosts;
+            if (learned != null && learned.length() > 0
+                    && !LEGACY_PRINTER_HOST.equals(learned)) {
+                hosts = new String[]{learned, LEGACY_PRINTER_HOST};
+            } else {
+                hosts = new String[]{LEGACY_PRINTER_HOST};
+            }
 
+            Exception last = null;
+            for (String host : hosts) {
+                try {
+                    Socket candidate = new Socket();
+                    candidate.setKeepAlive(true);
+                    candidate.setTcpNoDelay(true);
+                    candidate.connect(new InetSocketAddress(host, PRINTER_PORT),
+                            CONNECT_TIMEOUT_MS);
+                    candidate.setSoTimeout(RESPONSE_TIMEOUT_MS);
+                    s = candidate;
+                    final String target = host;
+                    runOnUiThread(() -> setStatus(
+                            "프린터 TCP 연결됨: " + target + ":" + PRINTER_PORT));
+                    break;
+                } catch (Exception e) {
+                    last = e;
+                }
+            }
+            if (s == null) throw new IOException("프린터 TCP 연결 실패", last);
+        }
+
+        try {
             OutputStream out = new BufferedOutputStream(s.getOutputStream());
             byte[] command = makePrintPacket(jpeg.length);
             out.write(command);
@@ -274,7 +307,9 @@ public class MainActivity extends Activity {
                     setStatus("인쇄 데이터 전송 완료. 프린터 응답 대기..."));
             readResponses(s);
         } finally {
-            try { s.close(); } catch (Exception ignored) {}
+            if (closeWhenDone) {
+                try { s.close(); } catch (Exception ignored) {}
+            }
         }
     }
 
@@ -365,6 +400,42 @@ public class MainActivity extends Activity {
         runOnUiThread(() -> setStatus(m));
     }
 
+    private void startSocketServer() {
+        closeServerOnly();
+        io.execute(() -> {
+            try {
+                ServerSocket ss = new ServerSocket(PRINTER_PORT);
+                serverSocket = ss;
+                runOnUiThread(() -> setStatus(
+                        "Wi-Fi Direct 그룹 오너. 프린터 TCP 연결 대기 중..."));
+                Socket s = ss.accept();
+                s.setKeepAlive(true);
+                s.setTcpNoDelay(true);
+                s.setSoTimeout(RESPONSE_TIMEOUT_MS);
+                acceptedPrinterSocket = s;
+                runOnUiThread(() -> {
+                    pick.setEnabled(true);
+                    setStatus("프린터 TCP 연결됨. 사진을 선택하세요.");
+                });
+            } catch (Exception e) {
+                if (p2pConnected && phoneIsGroupOwner)
+                    runOnUiThread(() -> setStatus("프린터 TCP 서버 오류: " + errorText(e)));
+            }
+        });
+    }
+
+    private void closeServerOnly() {
+        try { if (serverSocket != null) serverSocket.close(); } catch (Exception ignored) {}
+        serverSocket = null;
+    }
+
+    private void closeSockets() {
+        closeServerOnly();
+        try { if (acceptedPrinterSocket != null) acceptedPrinterSocket.close(); }
+        catch (Exception ignored) {}
+        acceptedPrinterSocket = null;
+    }
+
     private String errorText(Exception e) {
         String m = e.getMessage();
         return e.getClass().getSimpleName() + (m == null ? "" : ": " + m);
@@ -438,20 +509,27 @@ public class MainActivity extends Activity {
                          * 10.192.168.1:1234, so retain it when Android cannot
                          * expose a usable group-owner address.
                          */
-                        if (host != null && host.length() > 0
-                                && !info.isGroupOwner) {
+                        phoneIsGroupOwner = info.isGroupOwner;
+                        if (!info.isGroupOwner && host != null && host.length() > 0) {
                             printerHost = host;
                         } else {
                             printerHost = LEGACY_PRINTER_HOST;
                         }
 
                         p2pConnected = true;
-                        pick.setEnabled(true);
-                        setStatus("Wi-Fi Direct 연결됨 (" + printerHost + ")");
+                        if (phoneIsGroupOwner) {
+                            pick.setEnabled(false);
+                            startSocketServer();
+                        } else {
+                            pick.setEnabled(true);
+                            setStatus("Wi-Fi Direct 연결됨 (" + printerHost + ")");
+                        }
                     });
                 } else {
                     p2pConnected = false;
+                    phoneIsGroupOwner = false;
                     printerHost = null;
+                    closeSockets();
                     pick.setEnabled(false);
                     setStatus("프린터 연결이 끊어졌습니다.");
                 }
