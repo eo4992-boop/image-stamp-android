@@ -8,6 +8,7 @@ import android.graphics.*;
 import android.net.NetworkInfo;
 import android.net.Uri;
 import android.net.wifi.p2p.*;
+import android.net.wifi.WpsInfo;
 import android.os.*;
 import android.view.*;
 import android.widget.*;
